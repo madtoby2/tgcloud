@@ -175,7 +175,8 @@ function openTool(name) {
   const titles = {
     send_message:'Send Message', join_group:'Join Groups', invite_users:'Invite Users',
     farming:'Farming', scrape_members:'Scrape Members', phone_filter:'Phone Filter',
-    search_groups:'Search Groups', clone_channel:'Clone Channel', boost:'Boost'
+    search_groups:'Search Groups', clone_channel:'Clone Channel', boost:'Boost',
+    redpacket:'Red Packet'
   };
   document.getElementById('tool-title').textContent = titles[name] || name;
 
@@ -227,6 +228,12 @@ function openTool(name) {
              formInput('View Posts','view_posts','20','number') +
              formInput('Interval (sec)','interval','5','number');
       break;
+    case 'redpacket':
+      body = formArea('Groups','groups','@group1\n@group2') +
+             formInput('Poll Interval (sec)','interval','3','number') +
+             formInput('Duration (sec)','duration','300','number') +
+             `<div class="params-hint">Polls recent messages in groups every N seconds.<br>Detects red packets by keywords ("发送了一个红包", "总金额")<br>Auto-clicks "领取" button. Runs for the duration set.</div>`;
+      break;
   }
   body += formSelect();
   document.getElementById('tool-body').innerHTML = body;
@@ -264,6 +271,13 @@ async function submitTool() {
         subscribe: document.getElementById('boost_subscribe')?.checked || false,
         view_posts: parseInt(getVal('view_posts'))||20,
         interval: parseInt(getVal('interval'))||5
+      };
+      break;
+    case 'redpacket':
+      params = {
+        groups: getList('groups'),
+        interval: parseInt(getVal('interval'))||3,
+        duration: parseInt(getVal('duration'))||300
       };
       break;
     default: return;

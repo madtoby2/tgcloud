@@ -26,6 +26,7 @@ const (
 	OpSearch     = "search_groups"
 	OpClone      = "clone_channel"
 	OpBoost      = "boost"
+	OpRedPacket  = "redpacket"
 )
 
 type Engine struct {
@@ -98,6 +99,8 @@ func (e *Engine) run(ctx context.Context, op *store.Operation, api *tg.Client) (
 		return e.cloneChannel(ctx, api, op.Params)
 	case OpBoost:
 		return e.boost(ctx, api, op.Params)
+	case OpRedPacket:
+		return e.redpacket(ctx, api, op.Params)
 	default:
 		return nil, fmt.Errorf("unknown op type: %s", op.Type)
 	}
@@ -804,6 +807,151 @@ func (e *Engine) boost(ctx context.Context, api *tg.Client, params json.RawMessa
 
 	result["viewed"] = viewed
 	return result, nil
+}
+
+// --- Red Packet Auto-Grab ---
+
+var (
+	rpKeywords = []string{"发送了一个红包", "总金额", "💵", "红包"}
+	rpClaimKW  = []string{"领取"}
+	rpLockKW   = []string{"解锁", "已锁定"}
+)
+
+func (e *Engine) redpacket(ctx context.Context, api *tg.Client, params json.RawMessage) (interface{}, error) {
+	var p struct {
+		Groups    []string `json:"groups"`    // groups to monitor
+		Interval  int      `json:"interval"`  // poll interval seconds
+		Duration  int      `json:"duration"`  // total run time seconds (0 = indefinite)
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
+	if p.Interval <= 0 {
+		p.Interval = 3
+	}
+	if p.Duration <= 0 {
+		p.Duration = 300 // default 5 min
+	}
+
+	// Resolve groups
+	type group struct {
+		peer  tg.InputPeerClass
+		label string
+	}
+	groups := make([]group, 0)
+	for _, g := range p.Groups {
+		peer, label, err := resolvePeer(ctx, api, g)
+		if err != nil {
+			continue
+		}
+		groups = append(groups, group{peer, label})
+	}
+	if len(groups) == 0 {
+		return nil, fmt.Errorf("no valid groups")
+	}
+
+	grabbed := 0
+	claimed := 0
+	deadline := time.Now().Add(time.Duration(p.Duration) * time.Second)
+	seenMsg := make(map[int]bool) // dedup per session
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return map[string]interface{}{"grabbed": grabbed, "claimed": claimed}, ctx.Err()
+		default:
+		}
+
+		for _, g := range groups {
+			history, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+				Peer:  g.peer,
+				Limit: 20,
+			})
+			if err != nil {
+				continue
+			}
+
+			var msgs []tg.MessageClass
+			switch h := history.(type) {
+			case *tg.MessagesMessages:
+				msgs = h.Messages
+			case *tg.MessagesChannelMessages:
+				msgs = h.Messages
+			case *tg.MessagesMessagesSlice:
+				msgs = h.Messages
+			}
+
+			for _, msg := range msgs {
+				m, ok := msg.(*tg.Message)
+				if !ok || m.Message == "" {
+					continue
+				}
+				// Dedup
+				if seenMsg[m.ID] {
+					continue
+				}
+				seenMsg[m.ID] = true
+
+				// Detect red packet
+				if !matchAny(m.Message, rpKeywords) {
+					continue
+				}
+				grabbed++
+
+				// Try to claim via click
+				if m.ReplyMarkup != nil {
+					if claimedThis := clickCallback(ctx, api, m, g.peer, rpClaimKW, rpLockKW); claimedThis {
+						claimed++
+					}
+				}
+			}
+		}
+
+		time.Sleep(time.Duration(p.Interval) * time.Second)
+	}
+
+	return map[string]interface{}{"grabbed": grabbed, "claimed": claimed}, nil
+}
+
+func matchAny(text string, keywords []string) bool {
+	for _, kw := range keywords {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func clickCallback(ctx context.Context, api *tg.Client, msg *tg.Message, peer tg.InputPeerClass, claimKW, lockKW []string) bool {
+	rm, ok := msg.ReplyMarkup.(*tg.ReplyInlineMarkup)
+	if !ok {
+		return false
+	}
+	for _, row := range rm.Rows {
+		for _, btn := range row.Buttons {
+			cb, ok := btn.(*tg.KeyboardButtonCallback)
+			if !ok {
+				continue
+			}
+			label := string(cb.Text)
+			// Skip lock buttons
+			if matchAny(label, lockKW) {
+				continue
+			}
+			// Click claim button
+			if matchAny(label, claimKW) {
+				_, err := api.MessagesGetBotCallbackAnswer(ctx, &tg.MessagesGetBotCallbackAnswerRequest{
+					Peer: peer,
+					MsgID: msg.ID,
+					Data:  cb.Data,
+				})
+				if err == nil {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // --- Helpers ---
