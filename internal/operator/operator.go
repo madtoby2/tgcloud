@@ -28,6 +28,8 @@ const (
 	OpClone      = "clone_channel"
 	OpBoost      = "boost"
 	OpRedPacket  = "redpacket"
+	OpAutoReply  = "autoreply"
+	OpWarmup     = "warmup"
 )
 
 type Engine struct {
@@ -102,6 +104,10 @@ func (e *Engine) run(ctx context.Context, op *store.Operation, api *tg.Client) (
 		return e.boost(ctx, api, op.Params)
 	case OpRedPacket:
 		return e.redpacket(ctx, api, op.Params)
+	case OpAutoReply:
+		return e.autoreply(ctx, api, op.Params)
+	case OpWarmup:
+		return e.warmup(ctx, api, op.Params)
 	default:
 		return nil, fmt.Errorf("unknown op type: %s", op.Type)
 	}
@@ -1074,6 +1080,198 @@ func cleanButtonText(s string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+// --- Auto-Reply Engine ---
+
+type replyRule struct {
+	Keyword  string `json:"keyword"`
+	Response string `json:"response"`
+	Match    string `json:"match"` // contains, exact, regex
+}
+
+func (e *Engine) autoreply(ctx context.Context, api *tg.Client, params json.RawMessage) (interface{}, error) {
+	var p struct {
+		Targets  []string    `json:"targets"` // groups/DMs to monitor
+		Rules    []replyRule `json:"rules"`    // keyword→response mapping
+		Interval int         `json:"interval"` // poll sec
+		Duration int         `json:"duration"` // total sec
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
+	if len(p.Rules) == 0 {
+		return nil, fmt.Errorf("no rules configured")
+	}
+	if p.Interval <= 0 { p.Interval = 5 }
+	if p.Duration <= 0 { p.Duration = 300 }
+
+	// Resolve targets
+	var peers []tg.InputPeerClass
+	for _, t := range p.Targets {
+		peer, _, err := resolvePeer(ctx, api, t)
+		if err != nil {
+			continue
+		}
+		peers = append(peers, peer)
+	}
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("no valid targets")
+	}
+
+	replied := 0
+	seen := make(map[int]bool)
+	deadline := time.Now().Add(time.Duration(p.Duration) * time.Second)
+	cooldown := make(map[string]time.Time) // key = target:user → last reply
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return map[string]interface{}{"replied": replied}, ctx.Err()
+		default:
+		}
+
+		for _, peer := range peers {
+			history, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+				Peer:  peer,
+				Limit: 30,
+			})
+			if err != nil { continue }
+
+			var msgs []tg.MessageClass
+			switch h := history.(type) {
+			case *tg.MessagesMessages: msgs = h.Messages
+			case *tg.MessagesChannelMessages: msgs = h.Messages
+			case *tg.MessagesMessagesSlice: msgs = h.Messages
+			}
+
+			for _, msg := range msgs {
+				m, ok := msg.(*tg.Message)
+				if !ok || m.Message == "" || seen[m.ID] { continue }
+				seen[m.ID] = true
+
+				// Check cooldown per user (60s)
+				senderKey := fmt.Sprintf("%d", getSenderID(m))
+				if t, ok := cooldown[senderKey]; ok && time.Since(t) < 60*time.Second {
+					continue
+				}
+
+				for _, rule := range p.Rules {
+					if matchRule(m.Message, rule) {
+						_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+							Peer:     peer,
+							Message:  rule.Response,
+							RandomID: rand.Int63(),
+						})
+						if err != nil {
+							wait := tgclient.WaitFloodWait(err)
+							if wait > 0 { time.Sleep(wait); continue }
+						} else {
+							replied++
+							cooldown[senderKey] = time.Now()
+						}
+						break // one rule per message
+					}
+				}
+			}
+		}
+		time.Sleep(time.Duration(p.Interval) * time.Second)
+	}
+	return map[string]interface{}{"replied": replied}, nil
+}
+
+func matchRule(text string, rule replyRule) bool {
+	switch rule.Match {
+	case "exact":
+		return text == rule.Keyword
+	case "regex":
+		re, err := regexp.Compile(rule.Keyword)
+		if err != nil { return false }
+		return re.MatchString(text)
+	default: // contains
+		return strings.Contains(strings.ToLower(text), strings.ToLower(rule.Keyword))
+	}
+}
+
+func getSenderID(m *tg.Message) int64 {
+	if p, ok := m.PeerID.(*tg.PeerUser); ok { return p.UserID }
+	return 0
+}
+
+// --- Account Warmup ---
+
+func (e *Engine) warmup(ctx context.Context, api *tg.Client, params json.RawMessage) (interface{}, error) {
+	var p struct {
+		Channels  []string `json:"channels"`  // channels to browse
+		Duration  int      `json:"duration"`  // total sec
+		Interval  int      `json:"interval"`  // sec between actions
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
+	if p.Duration <= 0 { p.Duration = 600 }
+	if p.Interval <= 0 { p.Interval = 30 }
+
+	// Resolve channels
+	var peers []tg.InputPeerClass
+	for _, c := range p.Channels {
+		peer, _, err := resolvePeer(ctx, api, c)
+		if err != nil { continue }
+		peers = append(peers, peer)
+	}
+	if len(peers) == 0 {
+		// Use default dialogs
+		dialogs, _ := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{Limit: 10})
+		if d, ok := dialogs.(*tg.MessagesDialogsSlice); ok {
+			for _, dl := range d.Dialogs {
+				if dp, ok := dl.(*tg.Dialog); ok {
+					peers = append(peers, toInputPeer(dp.Peer))
+				}
+			}
+		}
+	}
+	if len(peers) == 0 {
+		peers = append(peers, &tg.InputPeerUser{})
+	}
+
+	actions := 0
+	deadline := time.Now().Add(time.Duration(p.Duration) * time.Second)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return map[string]interface{}{"actions": actions}, ctx.Err()
+		default:
+		}
+
+		peer := peers[rand.Intn(len(peers))]
+		action := rand.Intn(3)
+
+		switch action {
+		case 0: // Browse messages
+			api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+				Peer:  peer,
+				Limit: 10,
+			})
+		case 1: // Send typing indicator (simulate reading)
+			api.MessagesSetTyping(ctx, &tg.MessagesSetTypingRequest{
+				Peer:   peer,
+				Action: &tg.SendMessageTypingAction{},
+			})
+		case 2: // Get dialogs (simulate normal activity)
+			api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+				Limit: 5,
+			})
+		}
+		actions++
+
+		jitter := time.Duration(rand.Intn(p.Interval)) * time.Second
+		time.Sleep(time.Duration(p.Interval)*time.Second + jitter)
+	}
+
+	return map[string]interface{}{"actions": actions}, nil
+}
+
+// --- Helpers ---
 
 func resolvePeer(ctx context.Context, api *tg.Client, target string) (tg.InputPeerClass, string, error) {
 	target = strings.TrimSpace(target)

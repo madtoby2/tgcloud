@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -215,6 +216,24 @@ func (m *Manager) ListOperations(accountID int64) ([]*store.Operation, error) {
 
 func (m *Manager) CancelOperation(id int64) {
 	m.engine.Cancel(id)
+}
+
+func (m *Manager) ImportSession(phone, b64data string) error {
+	data, err := base64.StdEncoding.DecodeString(b64data)
+	if err != nil {
+		return fmt.Errorf("invalid base64: %w", err)
+	}
+	return m.store.SaveSession(phone, data)
+}
+
+func (m *Manager) RotateProxy(accountID int64, newProxy string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.clients[accountID]; ok {
+		c.cancel()
+		delete(m.clients, accountID)
+	}
+	return m.store.UpdateAccountProxy(accountID, newProxy)
 }
 
 func (m *Manager) Close() {

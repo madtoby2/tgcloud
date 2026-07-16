@@ -31,6 +31,8 @@ func (h *Handler) Routes() chi.Router {
 		r.Get("/operations", h.listOperations)
 		r.Post("/operations", h.createOperation)
 		r.Post("/operations/{id}/cancel", h.cancelOperation)
+		r.Post("/accounts/import", h.importSession)
+		r.Post("/accounts/{id}/proxy", h.rotateProxy)
 		r.Get("/status", h.systemStatus)
 	})
 	r.Get("/ws", h.wsh.ServeWS)
@@ -213,6 +215,48 @@ func (h *Handler) cancelOperation(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mgr.CancelOperation(id)
 	jsonOK(w, map[string]string{"status": "cancelled"})
+}
+
+func (h *Handler) importSession(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Phone   string `json:"phone"`
+		Session string `json:"session"` // base64-encoded session data
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid body", 400)
+		return
+	}
+	if req.Phone == "" || req.Session == "" {
+		jsonError(w, "phone and session required", 400)
+		return
+	}
+	// Store session, create account if not exists
+	if err := h.mgr.ImportSession(req.Phone, req.Session); err != nil {
+		jsonError(w, err.Error(), 500)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "imported", "phone": req.Phone})
+}
+
+func (h *Handler) rotateProxy(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		jsonError(w, "invalid id", 400)
+		return
+	}
+	var req struct {
+		Proxy string `json:"proxy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid body", 400)
+		return
+	}
+	if err := h.mgr.RotateProxy(id, req.Proxy); err != nil {
+		jsonError(w, err.Error(), 500)
+		return
+	}
+	h.wsh.Broadcast("proxy_rotated", map[string]interface{}{"id": id, "proxy": req.Proxy})
+	jsonOK(w, map[string]string{"status": "rotated"})
 }
 
 func (h *Handler) systemStatus(w http.ResponseWriter, r *http.Request) {

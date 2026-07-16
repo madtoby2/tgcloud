@@ -149,6 +149,11 @@ func (s *Store) DeleteAccount(id int64) error {
 	return err
 }
 
+func (s *Store) UpdateAccountProxy(id int64, proxy string) error {
+	_, err := s.db.Exec("UPDATE accounts SET proxy=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", proxy, id)
+	return err
+}
+
 // --- Session ---
 
 func (s *Store) SaveSession(phone string, data []byte) error {

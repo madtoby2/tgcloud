@@ -176,7 +176,7 @@ function openTool(name) {
     send_message:'Send Message', join_group:'Join Groups', invite_users:'Invite Users',
     farming:'Farming', scrape_members:'Scrape Members', phone_filter:'Phone Filter',
     search_groups:'Search Groups', clone_channel:'Clone Channel', boost:'Boost',
-    redpacket:'Red Packet'
+    redpacket:'Red Packet', autoreply:'Auto Reply', warmup:'Warmup'
   };
   document.getElementById('tool-title').textContent = titles[name] || name;
 
@@ -234,6 +234,15 @@ function openTool(name) {
              formInput('Duration (sec)','duration','300','number') +
              `<div class="params-hint">Polls recent messages in groups every N seconds.<br>Detects red packets by keywords ("发送了一个红包", "总金额")<br>Auto-clicks "领取" button. Runs for the duration set.</div>`;
       break;
+    case 'autoreply':
+      body = formArea('Targets','targets','@group1\n@me') +
+             formArea('Rules (JSON)','rules',
+              '[{"keyword":"hello","response":"Hi!","match":"contains"},' +
+              '{"keyword":"price","response":"Contact @admin","match":"contains"}]') +
+             formInput('Poll Interval (sec)','interval','5','number') +
+             formInput('Duration (sec)','duration','300','number') +
+             `<div class="params-hint">match: contains | exact | regex<br>60s cooldown per user to prevent spam.</div>`;
+      break;
   }
   body += formSelect();
   document.getElementById('tool-body').innerHTML = body;
@@ -278,6 +287,23 @@ async function submitTool() {
         groups: getList('groups'),
         interval: parseInt(getVal('interval'))||3,
         duration: parseInt(getVal('duration'))||300
+      };
+      break;
+    case 'autoreply':
+      let rules = [];
+      try { rules = JSON.parse(getVal('rules')); } catch(e) { alert('Invalid JSON in rules'); return; }
+      params = {
+        targets: getList('targets'),
+        rules: rules,
+        interval: parseInt(getVal('interval'))||5,
+        duration: parseInt(getVal('duration'))||300
+      };
+      break;
+    case 'warmup':
+      params = {
+        channels: getList('channels'),
+        duration: parseInt(getVal('duration'))||600,
+        interval: parseInt(getVal('interval'))||30
       };
       break;
     default: return;
