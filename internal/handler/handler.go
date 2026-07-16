@@ -206,7 +206,13 @@ func (h *Handler) createOperation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) cancelOperation(w http.ResponseWriter, r *http.Request) {
-	jsonOK(w, map[string]string{"status": "not_implemented"})
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		jsonError(w, "invalid id", 400)
+		return
+	}
+	h.mgr.CancelOperation(id)
+	jsonOK(w, map[string]string{"status": "cancelled"})
 }
 
 func (h *Handler) systemStatus(w http.ResponseWriter, r *http.Request) {

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/madtoby2/tgcloud/internal/operator"
 	"github.com/madtoby2/tgcloud/internal/store"
 	"github.com/madtoby2/tgcloud/internal/tgclient"
 	"go.uber.org/zap"
@@ -20,17 +21,23 @@ type PendingCode struct {
 	DoneChan  chan struct{}
 }
 
+type connectedClient struct {
+	client   *tgclient.Client
+	accountID int64
+	cancel   context.CancelFunc
+}
+
 type Manager struct {
 	store    *store.Store
 	logger   *zap.Logger
 	apiID    int
-	apiHash  string
+	apiHash   string
+	engine   *operator.Engine
 
-	mu       sync.RWMutex
-	clients  map[int64]*tgclient.Client
-	cancels  map[int64]context.CancelFunc
-	pending  map[string]*PendingCode
-	connecting atomic.Int64
+	mu          sync.RWMutex
+	clients     map[int64]*connectedClient
+	pending     map[string]*PendingCode
+	connecting  atomic.Int64
 }
 
 func New(s *store.Store, apiID int, apiHash string, logger *zap.Logger) *Manager {
@@ -39,11 +46,13 @@ func New(s *store.Store, apiID int, apiHash string, logger *zap.Logger) *Manager
 		logger:  logger,
 		apiID:   apiID,
 		apiHash: apiHash,
-		clients: make(map[int64]*tgclient.Client),
-		cancels: make(map[int64]context.CancelFunc),
+		engine:  operator.New(s, logger),
+		clients: make(map[int64]*connectedClient),
 		pending: make(map[string]*PendingCode),
 	}
 }
+
+func (m *Manager) Engine() *operator.Engine { return m.engine }
 
 func (m *Manager) AddAccount(phone, proxy string) (*store.Account, error) {
 	return m.store.CreateAccount(phone, proxy)
@@ -59,11 +68,10 @@ func (m *Manager) ListAccounts() ([]*store.Account, error) {
 
 func (m *Manager) DeleteAccount(id int64) error {
 	m.mu.Lock()
-	if cancel, ok := m.cancels[id]; ok {
-		cancel()
-		delete(m.cancels, id)
+	if c, ok := m.clients[id]; ok {
+		c.cancel()
+		delete(m.clients, id)
 	}
-	delete(m.clients, id)
 	m.mu.Unlock()
 	return m.store.DeleteAccount(id)
 }
@@ -87,14 +95,20 @@ func (m *Manager) RequestLogin(phone string) (*PendingCode, error) {
 	m.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	m.mu.Lock()
-	m.cancels[account.ID] = cancel
-	m.mu.Unlock()
-
 	client := tgclient.New(phone, m.apiID, m.apiHash, "", m.store, m.logger)
 	client.SetStatusCallback(func(status string, floodWait int64) {
 		m.store.UpdateAccountStatus(account.ID, status, floodWait)
 	})
+
+	cc := &connectedClient{
+		client:   client,
+		accountID: account.ID,
+		cancel:   cancel,
+	}
+
+	m.mu.Lock()
+	m.clients[account.ID] = cc
+	m.mu.Unlock()
 
 	go func() {
 		err := client.Connect(ctx,
@@ -115,13 +129,15 @@ func (m *Manager) RequestLogin(phone string) (*PendingCode, error) {
 				}
 			},
 		)
+
+		m.mu.Lock()
+		delete(m.pending, phone)
+		m.mu.Unlock()
+
 		if err != nil && err != context.Canceled {
 			m.store.UpdateAccountStatus(account.ID, "error", 0)
 			p.ErrChan <- err
 		}
-		m.mu.Lock()
-		delete(m.pending, phone)
-		m.mu.Unlock()
 		close(p.DoneChan)
 	}()
 
@@ -135,7 +151,6 @@ func (m *Manager) SubmitCode(phone, code string) error {
 	if !ok {
 		return fmt.Errorf("no pending login for %s", phone)
 	}
-
 	select {
 	case p.CodeChan <- code:
 		return nil
@@ -151,7 +166,6 @@ func (m *Manager) SubmitPassword(phone, password string) error {
 	if !ok {
 		return fmt.Errorf("no pending login for %s", phone)
 	}
-
 	select {
 	case p.PassChan <- password:
 		return nil
@@ -166,26 +180,47 @@ func (m *Manager) GetPendingCode(phone string) *PendingCode {
 	return m.pending[phone]
 }
 
-func (m *Manager) GetClient(id int64) *tgclient.Client {
+func (m *Manager) GetClientAPI(id int64) *tgclient.Client {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.clients[id]
+	if c, ok := m.clients[id]; ok {
+		return c.client
+	}
+	return nil
 }
 
 // --- Operations ---
 
 func (m *Manager) CreateOperation(accountID int64, opType string, params json.RawMessage) (*store.Operation, error) {
-	return m.store.CreateOperation(accountID, opType, params)
+	op, err := m.store.CreateOperation(accountID, opType, params)
+	if err != nil {
+		return nil, err
+	}
+
+	// Auto-execute if account is online
+	cli := m.GetClientAPI(accountID)
+	if cli != nil {
+		api := cli.API()
+		if api != nil {
+			m.engine.Execute(op, api)
+		}
+	}
+
+	return op, nil
 }
 
 func (m *Manager) ListOperations(accountID int64) ([]*store.Operation, error) {
 	return m.store.ListOperations(accountID)
 }
 
+func (m *Manager) CancelOperation(id int64) {
+	m.engine.Cancel(id)
+}
+
 func (m *Manager) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, cancel := range m.cancels {
-		cancel()
+	for _, c := range m.clients {
+		c.cancel()
 	}
 }
