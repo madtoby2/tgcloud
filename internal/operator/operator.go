@@ -1193,7 +1193,7 @@ func matchRule(text string, rule replyRule) bool {
 }
 
 func getSenderID(m *tg.Message) int64 {
-	if p, ok := m.PeerID.(*tg.PeerUser); ok { return p.UserID }
+	if p, ok := m.FromID.(*tg.PeerUser); ok { return p.UserID }
 	return 0
 }
 
@@ -1273,26 +1273,45 @@ func (e *Engine) warmup(ctx context.Context, api *tg.Client, params json.RawMess
 
 // --- Helpers ---
 
-func resolvePeer(ctx context.Context, api *tg.Client, target string) (tg.InputPeerClass, string, error) {
+// resolveInputPeer resolves a target string to a proper InputPeer with correct AccessHash.
+func resolveInputPeer(ctx context.Context, api *tg.Client, target string) (tg.InputPeerClass, string, error) {
 	target = strings.TrimSpace(target)
-	if strings.HasPrefix(target, "@") || (!strings.Contains(target, " ") && !strings.HasPrefix(target, "t.me")) {
-		username := strings.TrimPrefix(target, "@")
-		res, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{
-			Username: username,
-		})
-		if err != nil {
-			return nil, target, err
-		}
-		peer := toInputPeer(res.Peer)
-		if peer == nil {
-			return nil, target, fmt.Errorf("cannot convert peer")
-		}
-		return peer, username, nil
+	username := strings.TrimPrefix(target, "@")
+	username = strings.TrimPrefix(username, "https://t.me/")
+	username = strings.TrimPrefix(username, "t.me/")
+
+	res, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{
+		Username: username,
+	})
+	if err != nil {
+		return nil, target, err
 	}
-	return nil, target, fmt.Errorf("unsupported target: %s", target)
+
+	switch p := res.Peer.(type) {
+	case *tg.PeerUser:
+		for _, u := range res.Users {
+			if user, ok := u.(*tg.User); ok && user.ID == p.UserID {
+				return &tg.InputPeerUser{UserID: user.ID, AccessHash: user.AccessHash}, username, nil
+			}
+		}
+	case *tg.PeerChat:
+		return &tg.InputPeerChat{ChatID: p.ChatID}, username, nil
+	case *tg.PeerChannel:
+		for _, c := range res.Chats {
+			if ch, ok := c.(*tg.Channel); ok && ch.ID == p.ChannelID {
+				return &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.AccessHash}, username, nil
+			}
+		}
+	}
+	return nil, target, fmt.Errorf("cannot resolve peer: %s", target)
 }
 
-// toInputPeer converts an output PeerClass to InputPeerClass
+// resolvePeer is legacy — prefers resolveInputPeer for proper access hashes
+func resolvePeer(ctx context.Context, api *tg.Client, target string) (tg.InputPeerClass, string, error) {
+	return resolveInputPeer(ctx, api, target)
+}
+
+// toInputPeer converts an output PeerClass to InputPeerClass (legacy, use resolveInputPeer instead)
 func toInputPeer(p tg.PeerClass) tg.InputPeerClass {
 	switch p := p.(type) {
 	case *tg.PeerUser:

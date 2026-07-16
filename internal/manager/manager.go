@@ -78,9 +78,21 @@ func (m *Manager) DeleteAccount(id int64) error {
 }
 
 func (m *Manager) RequestLogin(phone string) (*PendingCode, error) {
-	account, err := m.AddAccount(phone, "")
-	if err != nil {
-		return nil, err
+	// Check if account already exists
+	accounts, _ := m.store.ListAccounts()
+	var account *store.Account
+	for _, a := range accounts {
+		if a.Phone == phone {
+			account = a
+			break
+		}
+	}
+	if account == nil {
+		var err error
+		account, err = m.AddAccount(phone, "")
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	p := &PendingCode{
