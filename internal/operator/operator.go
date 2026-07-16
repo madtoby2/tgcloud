@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -812,9 +813,11 @@ func (e *Engine) boost(ctx context.Context, api *tg.Client, params json.RawMessa
 // --- Red Packet Auto-Grab ---
 
 var (
-	rpKeywords = []string{"发送了一个红包", "总金额", "💵", "红包"}
-	rpClaimKW  = []string{"领取"}
-	rpLockKW   = []string{"解锁", "已锁定"}
+	rpKeywords  = []string{"发送了一个红包", "总金额", "💵", "红包"}
+	rpClaimKW   = []string{"领取"}
+	rpLockKW    = []string{"解锁", "已锁定"}
+	rpMathExpr  = regexp.MustCompile(`([\d一二三四五六七八九十百千万亿零]+)\s*([+\-×xX*÷/])\s*([\d一二三四五六七八九十百千万亿零]+)\s*[=＝]\s*[?？]`)
+	cnDigits    = map[rune]int64{'一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10,'百':100,'千':1000,'万':10000,'亿':100000000,'零':0}
 )
 
 func (e *Engine) redpacket(ctx context.Context, api *tg.Client, params json.RawMessage) (interface{}, error) {
@@ -898,9 +901,14 @@ func (e *Engine) redpacket(ctx context.Context, api *tg.Client, params json.RawM
 				}
 				grabbed++
 
-				// Try to claim via click
+				// Try claim: 1) direct "领取" click  2) captcha solve
 				if m.ReplyMarkup != nil {
 					if claimedThis := clickCallback(ctx, api, m, g.peer, rpClaimKW, rpLockKW); claimedThis {
+						claimed++
+						continue
+					}
+					// Try captcha
+					if claimedThis := solveAndClick(ctx, api, m, g.peer); claimedThis {
 						claimed++
 					}
 				}
@@ -954,7 +962,118 @@ func clickCallback(ctx context.Context, api *tg.Client, msg *tg.Message, peer tg
 	return false
 }
 
-// --- Helpers ---
+// solveAndClick finds math expression in text, computes answer, clicks matching button
+func solveAndClick(ctx context.Context, api *tg.Client, msg *tg.Message, peer tg.InputPeerClass) bool {
+	text := msg.Message
+	m := rpMathExpr.FindStringSubmatch(text)
+	if m == nil {
+		return false
+	}
+	a := parseCNNumber(m[1])
+	op := m[2]
+	b := parseCNNumber(m[3])
+
+	var answer int64
+	switch op {
+	case "+":
+		answer = a + b
+	case "-":
+		answer = a - b
+	case "×", "x", "X", "*":
+		answer = a * b
+	case "÷", "/":
+		if b != 0 {
+			answer = a / b
+		}
+	default:
+		return false
+	}
+
+	// Find button with matching label
+	rm, ok := msg.ReplyMarkup.(*tg.ReplyInlineMarkup)
+	if !ok {
+		return false
+	}
+	answerStr := fmt.Sprintf("%d", answer)
+	for _, row := range rm.Rows {
+		for _, btn := range row.Buttons {
+			cb, ok := btn.(*tg.KeyboardButtonCallback)
+			if !ok {
+				continue
+			}
+			label := cleanButtonText(string(cb.Text))
+			if label == answerStr {
+				_, err := api.MessagesGetBotCallbackAnswer(ctx, &tg.MessagesGetBotCallbackAnswerRequest{
+					Peer:  peer,
+					MsgID: msg.ID,
+					Data:  cb.Data,
+				})
+				return err == nil
+			}
+		}
+	}
+	return false
+}
+
+// parseCNNumber converts Chinese or Arabic digit string to int64
+func parseCNNumber(s string) int64 {
+	s = strings.TrimSpace(s)
+	if n, ok := tryParseInt(s); ok {
+		return n
+	}
+	// Chinese digits
+	runes := []rune(s)
+	var result, section, num int64
+	for i := 0; i < len(runes); i++ {
+		ch := runes[i]
+		if val, ok := cnDigits[ch]; ok {
+			switch val {
+			case 10:
+				if num == 0 { num = 1 }
+				section += num * 10
+			case 100:
+				if num == 0 { num = 1 }
+				section += num * 100
+			case 1000:
+				if num == 0 { num = 1 }
+				section += num * 1000
+			case 10000:
+				if section == 0 { section = 1 }
+				result += section * 10000
+				section = 0
+			case 100000000:
+				if section == 0 { section = 1 }
+				result += section * 100000000
+				section = 0
+			default:
+				num = val
+			}
+		}
+	}
+	return result + section
+}
+
+func tryParseInt(s string) (int64, bool) {
+	var n int64
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return 0, false
+		}
+		n = n*10 + int64(ch-'0')
+	}
+	return n, true
+}
+
+func cleanButtonText(s string) string {
+	// Strip zero-width chars and emoji
+	var out []rune
+	for _, ch := range s {
+		if ch <= 0x200D && ch >= 0x200B { continue } // zero-width
+		if ch >= 0x1F300 && ch <= 0x1F9FF { continue } // emoji
+		out = append(out, ch)
+	}
+	return strings.TrimSpace(string(out))
+}
 
 func resolvePeer(ctx context.Context, api *tg.Client, target string) (tg.InputPeerClass, string, error) {
 	target = strings.TrimSpace(target)
