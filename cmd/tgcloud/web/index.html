@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tgcloud</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>tgcloud</h1>
+    <div class="status-bar">
+      <span id="ws-status" class="ws-offline">●</span>
+      <span id="sys-stats"></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Accounts</h2>
+        <button id="btn-add" class="btn">+ Add</button>
+      </div>
+      <div id="account-list" class="list"></div>
+    </section>
+
+    <section class="panel" id="detail-panel" style="display:none">
+      <div class="panel-header">
+        <h2 id="detail-title">Account</h2>
+        <button id="btn-close-detail" class="btn btn-sm">✕</button>
+      </div>
+      <div id="detail-content"></div>
+    </section>
+  </main>
+
+  <!-- Modal: Add Account -->
+  <div id="modal-add" class="modal" style="display:none">
+    <div class="modal-content">
+      <h2>Add Account</h2>
+      <label>Phone</label>
+      <input id="add-phone" type="text" placeholder="+8613800138000">
+      <label>Proxy (optional)</label>
+      <input id="add-proxy" type="text" placeholder="socks5://127.0.0.1:1080">
+      <div class="modal-actions">
+        <button id="btn-add-confirm" class="btn btn-primary">Add</button>
+        <button class="btn btn-cancel" onclick="closeModal('modal-add')">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Login Code -->
+  <div id="modal-login" class="modal" style="display:none">
+    <div class="modal-content">
+      <h2>Enter Code</h2>
+      <p id="login-phone"></p>
+      <input id="login-code" type="text" placeholder="12345">
+      <div class="modal-actions">
+        <button id="btn-code-confirm" class="btn btn-primary">Submit</button>
+        <button class="btn btn-cancel" onclick="closeModal('modal-login')">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: 2FA Password -->
+  <div id="modal-password" class="modal" style="display:none">
+    <div class="modal-content">
+      <h2>2FA Password</h2>
+      <p id="pass-phone"></p>
+      <input id="pass-input" type="password" placeholder="Your 2FA password">
+      <div class="modal-actions">
+        <button id="btn-pass-confirm" class="btn btn-primary">Submit</button>
+        <button class="btn btn-cancel" onclick="closeModal('modal-password')">Cancel</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
