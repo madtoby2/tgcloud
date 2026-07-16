@@ -25,6 +25,7 @@ const (
 	OpPhoneCheck = "phone_filter"
 	OpSearch     = "search_groups"
 	OpClone      = "clone_channel"
+	OpBoost      = "boost"
 )
 
 type Engine struct {
@@ -95,6 +96,8 @@ func (e *Engine) run(ctx context.Context, op *store.Operation, api *tg.Client) (
 		return e.searchGroups(ctx, api, op.Params)
 	case OpClone:
 		return e.cloneChannel(ctx, api, op.Params)
+	case OpBoost:
+		return e.boost(ctx, api, op.Params)
 	default:
 		return nil, fmt.Errorf("unknown op type: %s", op.Type)
 	}
@@ -685,6 +688,122 @@ func (e *Engine) cloneChannel(ctx context.Context, api *tg.Client, params json.R
 	}
 
 	return map[string]interface{}{"cloned": cloned, "skipped": skipped}, nil
+}
+
+// --- Boost (subscribe + views) ---
+
+func (e *Engine) boost(ctx context.Context, api *tg.Client, params json.RawMessage) (interface{}, error) {
+	var p struct {
+		Channel   string `json:"channel"`     // target channel
+		Subscribe bool   `json:"subscribe"`   // join the channel
+		ViewPosts int    `json:"view_posts"`  // how many recent posts to view
+		Interval  int    `json:"interval"`    // seconds between views
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
+	if p.ViewPosts <= 0 {
+		p.ViewPosts = 10
+	}
+	if p.Interval <= 0 {
+		p.Interval = 5
+	}
+
+	// Resolve channel
+	peer, _, err := resolvePeer(ctx, api, p.Channel)
+	if err != nil {
+		return nil, fmt.Errorf("resolve channel: %w", err)
+	}
+	chPeer, ok := peer.(*tg.InputPeerChannel)
+	if !ok {
+		return nil, fmt.Errorf("not a channel: %s", p.Channel)
+	}
+	_ = chPeer
+
+	result := map[string]interface{}{"channel": p.Channel}
+
+	// Step 1: Subscribe (join channel)
+	if p.Subscribe {
+		// Need AccessHash from Chats in resolve response — use resolve again with full chat info
+		res, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{
+			Username: strings.TrimPrefix(p.Channel, "@"),
+		})
+		if err != nil {
+			result["subscribe_error"] = err.Error()
+		} else {
+			for _, chat := range res.Chats {
+				if c, ok := chat.(*tg.Channel); ok {
+					_, err := api.ChannelsJoinChannel(ctx, &tg.InputChannel{
+						ChannelID:  c.ID,
+						AccessHash: c.AccessHash,
+					})
+					if err != nil {
+						result["subscribe_error"] = err.Error()
+					} else {
+						result["subscribed"] = true
+					}
+					break
+				}
+			}
+		}
+		// Small delay after join
+		time.Sleep(2 * time.Second)
+	}
+
+	// Step 2: View posts (read history = TG counts as view)
+	viewed := 0
+	offsetID := 0
+	for viewed < p.ViewPosts {
+		select {
+		case <-ctx.Done():
+			result["viewed"] = viewed
+			return result, ctx.Err()
+		default:
+		}
+
+		history, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:     peer,
+			OffsetID: offsetID,
+			Limit:    min(100, p.ViewPosts-viewed),
+		})
+		if err != nil {
+			result["view_error"] = err.Error()
+			break
+		}
+
+		var msgs []tg.MessageClass
+		switch h := history.(type) {
+		case *tg.MessagesMessages:
+			msgs = h.Messages
+		case *tg.MessagesChannelMessages:
+			msgs = h.Messages
+		case *tg.MessagesMessagesSlice:
+			msgs = h.Messages
+		}
+
+		for _, msg := range msgs {
+			if m, ok := msg.(*tg.Message); ok {
+				// Read message = increment view count on TG's side
+				_, err := api.MessagesGetMessages(ctx, []tg.InputMessageClass{
+					&tg.InputMessageID{ID: m.ID},
+				})
+				if err == nil {
+					viewed++
+				}
+				offsetID = m.ID
+			}
+		}
+
+		if len(msgs) == 0 || len(msgs) < min(100, p.ViewPosts-viewed) {
+			break
+		}
+
+		// Rate limit
+		time.Sleep(time.Duration(p.Interval) * time.Second)
+	}
+
+	result["viewed"] = viewed
+	return result, nil
 }
 
 // --- Helpers ---

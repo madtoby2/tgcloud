@@ -175,7 +175,7 @@ function openTool(name) {
   const titles = {
     send_message:'Send Message', join_group:'Join Groups', invite_users:'Invite Users',
     farming:'Farming', scrape_members:'Scrape Members', phone_filter:'Phone Filter',
-    search_groups:'Search Groups', clone_channel:'Clone Channel'
+    search_groups:'Search Groups', clone_channel:'Clone Channel', boost:'Boost'
   };
   document.getElementById('tool-title').textContent = titles[name] || name;
 
@@ -221,6 +221,12 @@ function openTool(name) {
               <option value="media_only">Media only</option>
               <option value="text_only">Text only</option></select></div>`;
       break;
+    case 'boost':
+      body = formInput('Channel','channel','@target_channel') +
+             `<div class="form-group"><label><input type="checkbox" id="boost_subscribe" checked style="width:auto;margin-right:8px"> Subscribe (join channel)</label></div>` +
+             formInput('View Posts','view_posts','20','number') +
+             formInput('Interval (sec)','interval','5','number');
+      break;
   }
   body += formSelect();
   document.getElementById('tool-body').innerHTML = body;
@@ -251,6 +257,14 @@ async function submitTool() {
       params = { source: getVal('source'), target: getVal('target'), limit: parseInt(getVal('limit'))||100 };
       if (filter === 'media_only') params.media_only = true;
       if (filter === 'text_only') params.text_only = true;
+      break;
+    case 'boost':
+      params = {
+        channel: getVal('channel'),
+        subscribe: document.getElementById('boost_subscribe')?.checked || false,
+        view_posts: parseInt(getVal('view_posts'))||20,
+        interval: parseInt(getVal('interval'))||5
+      };
       break;
     default: return;
   }
