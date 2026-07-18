@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/telegram/uploader"
 	"github.com/madtoby2/tgcloud/internal/store"
 	"github.com/madtoby2/tgcloud/internal/tgclient"
 	"go.uber.org/zap"
@@ -201,71 +204,166 @@ func (e *Engine) joinGroup(ctx context.Context, api *tg.Client, params json.RawM
 
 func (e *Engine) sendMessage(ctx context.Context, api *tg.Client, params json.RawMessage) (interface{}, error) {
 	var p struct {
-		Targets  []string `json:"targets"`  // usernames or channel IDs
+		Targets  []string `json:"targets"`
 		Message  string   `json:"message"`
-		Media    string   `json:"media"`   // path to media file (future)
-		Interval int      `json:"interval"` // seconds between sends
+		Media    string   `json:"media"`    // path to media file (local path)
+		Medias   []string `json:"medias"`   // multiple media files
+		Interval int      `json:"interval"`
 	}
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, fmt.Errorf("invalid params: %w", err)
 	}
-	if p.Interval <= 0 {
-		p.Interval = 5
-	}
+	if p.Interval <= 0 { p.Interval = 5 }
 
 	sent, failed := 0, 0
 
-	// Resolve targets first
+	// Collect all media paths
+	mediaPaths := make([]string, 0)
+	if p.Media != "" { mediaPaths = append(mediaPaths, p.Media) }
+	mediaPaths = append(mediaPaths, p.Medias...)
+
+	// Upload media files once (reuse across targets)
+	up := uploader.NewUploader(api)
+	var uploadedMedia []tg.InputMediaClass
+	if len(mediaPaths) > 0 {
+		for _, mp := range mediaPaths {
+			media, err := uploadMedia(ctx, up, mp)
+			if err != nil {
+				e.logger.Warn("upload failed", zap.String("file", mp), zap.Error(err))
+				continue
+			}
+			uploadedMedia = append(uploadedMedia, media)
+		}
+	}
+
+	// Resolve targets
 	type target struct {
 		peer  tg.InputPeerClass
 		label string
 	}
 	targets := make([]target, 0)
-
 	for _, t := range p.Targets {
 		peer, label, err := resolvePeer(ctx, api, t)
-		if err != nil {
-			failed++
-			continue
-		}
+		if err != nil { failed++; continue }
 		targets = append(targets, target{peer, label})
 	}
 
 	// Send to each target
 	for _, t := range targets {
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-ctx.Done(): return nil, ctx.Err()
 		default:
 		}
 
-		_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:    t.peer,
-			Message: p.Message,
-			RandomID: rand.Int63(),
-		})
-		if err != nil {
-			wait := tgclient.WaitFloodWait(err)
-			if wait > 0 {
-				e.logger.Warn("flood wait during send",
-					zap.String("target", t.label),
-					zap.Duration("wait", wait))
-				time.Sleep(wait)
-				continue
-			}
-			e.logger.Error("send failed", zap.String("target", t.label), zap.Error(err))
-			failed++
-		} else {
-			sent++
+		if len(uploadedMedia) > 0 {
+			// Send media (one media per target from the pool)
+			media := uploadedMedia[rand.Intn(len(uploadedMedia))]
+			_, err := api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
+				Peer:     t.peer,
+				Media:    media,
+				Message:  p.Message,
+				RandomID: rand.Int63(),
+			})
+			if err != nil {
+				if wait := tgclient.WaitFloodWait(err); wait > 0 {
+					time.Sleep(wait); continue
+				}
+				failed++
+			} else { sent++ }
+		} else if p.Message != "" {
+			_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+				Peer: t.peer, Message: p.Message, RandomID: rand.Int63(),
+			})
+			if err != nil {
+				if wait := tgclient.WaitFloodWait(err); wait > 0 {
+					time.Sleep(wait); continue
+				}
+				failed++
+			} else { sent++ }
 		}
 
-		// Random interval
 		base := time.Duration(p.Interval) * time.Second
 		jitter := time.Duration(rand.Intn(p.Interval)) * time.Second
 		time.Sleep(base + jitter)
 	}
 
-	return map[string]interface{}{"sent": sent, "failed": failed}, nil
+	return map[string]interface{}{"sent": sent, "failed": failed, "media_uploaded": len(uploadedMedia)}, nil
+}
+
+// uploadMedia detects type by extension, uploads and returns InputMedia
+func uploadMedia(ctx context.Context, up *uploader.Uploader, path string) (tg.InputMediaClass, error) {
+	f, err := os.Open(path)
+	if err != nil { return nil, err }
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil { return nil, err }
+
+	upload := uploader.NewUpload(filepath.Base(path), f, stat.Size())
+	file, err := up.Upload(ctx, upload)
+	if err != nil { return nil, err }
+
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".webp", ".bmp":
+		return &tg.InputMediaUploadedPhoto{File: file}, nil
+	case ".gif", ".mp4":
+		doc := &tg.InputMediaUploadedDocument{
+			File: file,
+			Attributes: []tg.DocumentAttributeClass{
+				&tg.DocumentAttributeVideo{RoundMessage: ext == ".mp4", SupportsStreaming: true},
+			},
+			MimeType: mimeByExt(ext),
+		}
+		return doc, nil
+	case ".webm", ".mkv", ".avi", ".mov":
+		return &tg.InputMediaUploadedDocument{
+			File: file,
+			Attributes: []tg.DocumentAttributeClass{
+				&tg.DocumentAttributeVideo{SupportsStreaming: true},
+			},
+			MimeType: mimeByExt(ext),
+		}, nil
+	case ".mp3", ".ogg", ".wav", ".flac", ".opus":
+		return &tg.InputMediaUploadedDocument{
+			File: file,
+			Attributes: []tg.DocumentAttributeClass{
+				&tg.DocumentAttributeAudio{Duration: 0, Title: filepath.Base(path)},
+			},
+			MimeType: mimeByExt(ext),
+		}, nil
+	case ".pdf", ".zip", ".rar", ".7z", ".doc", ".docx", ".txt", ".apk":
+		return &tg.InputMediaUploadedDocument{
+			File:      file,
+			MimeType:  mimeByExt(ext),
+			Attributes: []tg.DocumentAttributeClass{&tg.DocumentAttributeFilename{FileName: filepath.Base(path)}},
+		}, nil
+	default:
+		// Generic document
+		return &tg.InputMediaUploadedDocument{
+			File:      file,
+			Attributes: []tg.DocumentAttributeClass{&tg.DocumentAttributeFilename{FileName: filepath.Base(path)}},
+		}, nil
+	}
+}
+
+func mimeByExt(ext string) string {
+	switch ext {
+	case ".jpg", ".jpeg": return "image/jpeg"
+	case ".png": return "image/png"
+	case ".webp": return "image/webp"
+	case ".gif": return "image/gif"
+	case ".mp4": return "video/mp4"
+	case ".webm": return "video/webm"
+	case ".mkv": return "video/x-matroska"
+	case ".mp3": return "audio/mpeg"
+	case ".ogg": return "audio/ogg"
+	case ".opus": return "audio/opus"
+	case ".pdf": return "application/pdf"
+	case ".zip": return "application/zip"
+	case ".apk": return "application/vnd.android.package-archive"
+	default: return "application/octet-stream"
+	}
 }
 
 // --- Invite Users ---

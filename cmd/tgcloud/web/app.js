@@ -186,6 +186,8 @@ function openTool(name) {
     case 'send_message':
       body = formLabel('Targets','targets_text','@username1, @username2') +
              formArea('Message','msg','Type your message...') +
+             formInput('Media (file path)','media','C:\\media\\photo.jpg') +
+             formArea('Multiple Media (one per line)','medias','C:\\media\\img1.jpg\nC:\\media\\vid1.mp4') +
              formInput('Interval (sec)','interval','5','number');
       break;
     case 'join_group':
@@ -270,7 +272,7 @@ async function submitTool() {
   let params = {};
   switch (currentTool) {
     case 'send_message':
-      params = { targets: getList('targets_text'), message: getVal('msg'), interval: parseInt(getVal('interval'))||5 }; break;
+      params = { targets: getList('targets_text'), message: getVal('msg'), media: getVal('media'), medias: getList('medias'), interval: parseInt(getVal('interval'))||5 }; break;
     case 'join_group': params = { links: getList('links') }; break;
     case 'invite_users':
       params = { channel: getVal('channel'), users: getList('users'), max_users: parseInt(getVal('max_users'))||50 }; break;
