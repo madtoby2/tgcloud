@@ -30,6 +30,7 @@ const (
 	OpRedPacket  = "redpacket"
 	OpAutoReply  = "autoreply"
 	OpWarmup     = "warmup"
+	OpScrapeMsgs = "scrape_scripts"
 )
 
 type Engine struct {
@@ -108,6 +109,8 @@ func (e *Engine) run(ctx context.Context, op *store.Operation, api *tg.Client) (
 		return e.autoreply(ctx, api, op.Params)
 	case OpWarmup:
 		return e.warmup(ctx, api, op.Params)
+	case OpScrapeMsgs:
+		return e.scrapeScripts(ctx, api, op.Params)
 	default:
 		return nil, fmt.Errorf("unknown op type: %s", op.Type)
 	}
@@ -327,27 +330,24 @@ func (e *Engine) inviteUsers(ctx context.Context, api *tg.Client, params json.Ra
 
 func (e *Engine) farming(ctx context.Context, api *tg.Client, params json.RawMessage) (interface{}, error) {
 	var p struct {
-		Groups    []string `json:"groups"`    // group usernames/links
+		Groups    []string `json:"groups"`
 		Messages  []string `json:"messages"`  // message pool
-		Loops     int      `json:"loops"`      // how many times to cycle
-		MinDelay  int      `json:"min_delay"`  // seconds
-		MaxDelay  int      `json:"max_delay"`  // seconds
+		Loops     int      `json:"loops"`
+		MinDelay  int      `json:"min_delay"`
+		MaxDelay  int      `json:"max_delay"`
+		Mode      string   `json:"mode"`      // "solo" or "conversation"
+		Personas  int      `json:"personas"`  // how many fake personas (conversation mode)
+		ReplyGap  int      `json:"reply_gap"` // seconds between replies in conversation
 	}
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, fmt.Errorf("invalid params: %w", err)
 	}
-	if p.Loops <= 0 {
-		p.Loops = 1
-	}
-	if p.MinDelay <= 0 {
-		p.MinDelay = 30
-	}
-	if p.MaxDelay <= p.MinDelay {
-		p.MaxDelay = p.MinDelay + 60
-	}
-	if len(p.Messages) == 0 {
-		return nil, fmt.Errorf("no messages provided")
-	}
+	if p.Loops <= 0 { p.Loops = 1 }
+	if p.MinDelay <= 0 { p.MinDelay = 30 }
+	if p.MaxDelay <= p.MinDelay { p.MaxDelay = p.MinDelay + 60 }
+	if p.ReplyGap <= 0 { p.ReplyGap = 5 }
+	if p.Personas <= 0 { p.Personas = 3 }
+	if len(p.Messages) == 0 { return nil, fmt.Errorf("no messages provided") }
 
 	// Resolve groups
 	type group struct {
@@ -376,26 +376,57 @@ func (e *Engine) farming(ctx context.Context, api *tg.Client, params json.RawMes
 			default:
 			}
 
-			msg := p.Messages[rand.Intn(len(p.Messages))]
-			// Add random noise to avoid pattern detection
-			msg = addNoise(msg)
-
-			_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-				Peer:     g.peer,
-				Message:  msg,
-				RandomID: rand.Int63(),
-			})
-			if err != nil {
-				wait := tgclient.WaitFloodWait(err)
-				if wait > 0 {
-					e.logger.Warn("flood wait farming",
-						zap.String("group", g.label),
-						zap.Duration("wait", wait))
-					time.Sleep(wait)
-					continue
+			if p.Mode == "conversation" {
+				// Multi-persona reply chain in one group
+				for persona := 0; persona < p.Personas; persona++ {
+					select {
+					case <-ctx.Done():
+						return map[string]interface{}{"sent": sent, "loops": loop}, ctx.Err()
+					default:
+					}
+					msg := p.Messages[rand.Intn(len(p.Messages))]
+					msg = addNoise(msg)
+					// Add reply-to-like prefix (simulate conversational turn)
+					if persona > 0 && persona%2 == 1 {
+						// "Reply" feel: add agreement prefix
+						prefixes := []string{"确实 ", "是的 ", "哈哈 ", "对啊 ", "👍 ", ""}
+						msg = prefixes[rand.Intn(len(prefixes))] + msg
+					}
+					_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+						Peer:     g.peer,
+						Message:  msg,
+						RandomID: rand.Int63(),
+					})
+					if err != nil {
+						wait := tgclient.WaitFloodWait(err)
+						if wait > 0 {
+							time.Sleep(wait)
+							continue
+						}
+					} else {
+						sent++
+					}
+					// Short gap between personas
+					time.Sleep(time.Duration(p.ReplyGap) * time.Second)
 				}
 			} else {
-				sent++
+				// Solo mode: one message per group
+				msg := p.Messages[rand.Intn(len(p.Messages))]
+				msg = addNoise(msg)
+				_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+					Peer:     g.peer,
+					Message:  msg,
+					RandomID: rand.Int63(),
+				})
+				if err != nil {
+					wait := tgclient.WaitFloodWait(err)
+					if wait > 0 {
+						time.Sleep(wait)
+						continue
+					}
+				} else {
+					sent++
+				}
 			}
 
 			// Random delay
@@ -1269,6 +1300,69 @@ func (e *Engine) warmup(ctx context.Context, api *tg.Client, params json.RawMess
 	}
 
 	return map[string]interface{}{"actions": actions}, nil
+}
+
+// --- Script Scraper ---
+
+func (e *Engine) scrapeScripts(ctx context.Context, api *tg.Client, params json.RawMessage) (interface{}, error) {
+	var p struct {
+		Group    string `json:"group"`
+		Limit    int    `json:"limit"`
+		MinLen   int    `json:"min_len"`  // minimum message length
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
+	if p.Limit <= 0 { p.Limit = 200 }
+	if p.MinLen <= 0 { p.MinLen = 5 }
+
+	peer, _, err := resolveInputPeer(ctx, api, p.Group)
+	if err != nil {
+		return nil, fmt.Errorf("resolve group: %w", err)
+	}
+
+	scripts := make([]string, 0)
+	seen := make(map[string]bool)
+	offsetID := 0
+
+	for len(scripts) < p.Limit {
+		select {
+		case <-ctx.Done():
+			return map[string]interface{}{"scripts": scripts, "count": len(scripts)}, ctx.Err()
+		default:
+		}
+
+		history, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:     peer,
+			OffsetID: offsetID,
+			Limit:    min(100, p.Limit - len(scripts)),
+		})
+		if err != nil { break }
+
+		var msgs []tg.MessageClass
+		switch h := history.(type) {
+		case *tg.MessagesMessages: msgs = h.Messages
+		case *tg.MessagesChannelMessages: msgs = h.Messages
+		case *tg.MessagesMessagesSlice: msgs = h.Messages
+		}
+
+		for _, msg := range msgs {
+			m, ok := msg.(*tg.Message)
+			if !ok || m.Message == "" { continue }
+			text := strings.TrimSpace(m.Message)
+			if len([]rune(text)) < p.MinLen { continue }
+			// Dedup
+			if seen[text] { continue }
+			seen[text] = true
+			scripts = append(scripts, text)
+			offsetID = m.ID
+			if len(scripts) >= p.Limit { break }
+		}
+
+		if len(msgs) < 50 { break }
+	}
+
+	return map[string]interface{}{"scripts": scripts, "count": len(scripts)}, nil
 }
 
 // --- Helpers ---

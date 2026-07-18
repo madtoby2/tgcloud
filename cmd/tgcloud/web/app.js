@@ -176,7 +176,8 @@ function openTool(name) {
     send_message:'Send Message', join_group:'Join Groups', invite_users:'Invite Users',
     farming:'Farming', scrape_members:'Scrape Members', phone_filter:'Phone Filter',
     search_groups:'Search Groups', clone_channel:'Clone Channel', boost:'Boost',
-    redpacket:'Red Packet', autoreply:'Auto Reply', warmup:'Warmup'
+    redpacket:'Red Packet', autoreply:'Auto Reply', warmup:'Warmup',
+    scrape_scripts:'Scrape Scripts'
   };
   document.getElementById('tool-title').textContent = titles[name] || name;
 
@@ -197,6 +198,10 @@ function openTool(name) {
       break;
     case 'farming':
       body = formArea('Groups','groups','@group1\n@group2') +
+             `<div class="form-group"><label>Mode</label>
+              <select id="farming_mode"><option value="solo">Solo</option><option value="conversation">Conversation (multi-persona)</option></select></div>` +
+             formInput('Personas','personas','3','number') +
+             formInput('Reply Gap (sec)','reply_gap','5','number') +
              formArea('Messages (one per line)','messages','Hello everyone!\nGood morning\nNice to meet you all') +
              formInput('Loops','loops','3','number') +
              formInput('Min Delay (sec)','min_delay','30','number') +
@@ -243,6 +248,12 @@ function openTool(name) {
              formInput('Duration (sec)','duration','300','number') +
              `<div class="params-hint">match: contains | exact | regex<br>60s cooldown per user to prevent spam.</div>`;
       break;
+    case 'scrape_scripts':
+      body = formInput('Group','group','@target_group') +
+             formInput('Limit','limit','200','number') +
+             formInput('Min Length','min_len','5','number') +
+             `<div class="params-hint">Scrapes message text from group history.<br>Deduped, filtered by min character length.<br>Result saved as JSON scripts array — copy & use as farming messages.</div>`;
+      break;
   }
   body += formSelect();
   document.getElementById('tool-body').innerHTML = body;
@@ -264,7 +275,17 @@ async function submitTool() {
     case 'invite_users':
       params = { channel: getVal('channel'), users: getList('users'), max_users: parseInt(getVal('max_users'))||50 }; break;
     case 'farming':
-      params = { groups: getList('groups'), messages: getList('messages'), loops: parseInt(getVal('loops'))||3, min_delay: parseInt(getVal('min_delay'))||30, max_delay: parseInt(getVal('max_delay'))||90 }; break;
+      params = {
+        groups: getList('groups'),
+        messages: getList('messages'),
+        loops: parseInt(getVal('loops'))||3,
+        min_delay: parseInt(getVal('min_delay'))||30,
+        max_delay: parseInt(getVal('max_delay'))||90,
+        mode: document.getElementById('farming_mode')?.value || 'solo',
+        personas: parseInt(getVal('personas'))||3,
+        reply_gap: parseInt(getVal('reply_gap'))||5
+      };
+      break;
     case 'scrape_members': params = { group: getVal('group'), limit: parseInt(getVal('limit'))||200 }; break;
     case 'phone_filter': params = { phones: getList('phones') }; break;
     case 'search_groups': params = { query: getVal('query'), limit: parseInt(getVal('limit'))||50 }; break;
@@ -304,6 +325,13 @@ async function submitTool() {
         channels: getList('channels'),
         duration: parseInt(getVal('duration'))||600,
         interval: parseInt(getVal('interval'))||30
+      };
+      break;
+    case 'scrape_scripts':
+      params = {
+        group: getVal('group'),
+        limit: parseInt(getVal('limit'))||200,
+        min_len: parseInt(getVal('min_len'))||5
       };
       break;
     default: return;
