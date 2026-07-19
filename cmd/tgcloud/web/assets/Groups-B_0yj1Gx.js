@@ -1,0 +1,1 @@
+import{_ as t,o as a,c as o,a as s}from"./index-CoDpNap4.js";const r={};function c(n,e){return a(),o("div",null,[...e[0]||(e[0]=[s("h1",{class:"page-title"},"群组管理",-1),s("p",{class:"empty"},"功能开发中 — 通过账号同步采集已加入的群组",-1)])])}const p=t(r,[["render",c]]);export{p as default};

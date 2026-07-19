@@ -1,0 +1,1 @@
+import{_ as t,o as a,c as n,a as s}from"./index-CoDpNap4.js";const c={};function o(r,e){return a(),n("div",null,[...e[0]||(e[0]=[s("h1",{class:"page-title"},"频道管理",-1),s("p",{class:"empty"},"功能开发中 — 通过账号同步采集已加入的频道",-1)])])}const p=t(c,[["render",o]]);export{p as default};
