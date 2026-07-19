@@ -3,42 +3,42 @@ package manager
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
-	"github.com/madtoby2/tgcloud/internal/operator"
 	"github.com/madtoby2/tgcloud/internal/store"
 	"github.com/madtoby2/tgcloud/internal/tgclient"
 	"go.uber.org/zap"
 )
 
-type PendingCode struct {
-	Phone     string
-	CodeChan  chan string
-	PassChan  chan string
-	ErrChan   chan error
-	DoneChan  chan struct{}
+// PendingLogin holds channels for the auth flow
+type PendingLogin struct {
+	Phone    string
+	CodeChan chan string
+	PassChan chan string
+	ErrChan  chan error
+	DoneChan chan struct{}
 }
 
 type connectedClient struct {
-	client   *tgclient.Client
+	client    *tgclient.Client
 	accountID int64
-	cancel   context.CancelFunc
+	cancel    context.CancelFunc
 }
 
+// Manager is the account pool + orchestration
 type Manager struct {
 	store    *store.Store
 	logger   *zap.Logger
 	apiID    int
-	apiHash   string
-	engine   *operator.Engine
+	apiHash  string
 
-	mu          sync.RWMutex
-	clients     map[int64]*connectedClient
-	pending     map[string]*PendingCode
-	connecting  atomic.Int64
+	mu         sync.RWMutex
+	clients    map[int64]*connectedClient
+	pending    map[string]*PendingLogin
+	connecting atomic.Int64
 }
 
 func New(s *store.Store, apiID int, apiHash string, logger *zap.Logger) *Manager {
@@ -47,55 +47,37 @@ func New(s *store.Store, apiID int, apiHash string, logger *zap.Logger) *Manager
 		logger:  logger,
 		apiID:   apiID,
 		apiHash: apiHash,
-		engine:  operator.New(s, logger),
 		clients: make(map[int64]*connectedClient),
-		pending: make(map[string]*PendingCode),
+		pending: make(map[string]*PendingLogin),
 	}
 }
 
-func (m *Manager) Engine() *operator.Engine { return m.engine }
-
-func (m *Manager) AddAccount(phone, proxy string) (*store.Account, error) {
-	return m.store.CreateAccount(phone, proxy)
+func (m *Manager) AccountStore() *store.AccountStore {
+	return store.NewAccountStore(m.store.DB())
 }
 
-func (m *Manager) GetAccount(id int64) (*store.Account, error) {
-	return m.store.GetAccount(id)
-}
-
-func (m *Manager) ListAccounts() ([]*store.Account, error) {
-	return m.store.ListAccounts()
-}
-
-func (m *Manager) DeleteAccount(id int64) error {
-	m.mu.Lock()
-	if c, ok := m.clients[id]; ok {
-		c.cancel()
-		delete(m.clients, id)
+// AddAccount adds an account to the DB
+func (m *Manager) AddAccount(phone, proxy string) (int64, error) {
+	a, err := m.AccountStore().Create(phone, proxy)
+	if err != nil {
+		return 0, err
 	}
-	m.mu.Unlock()
-	return m.store.DeleteAccount(id)
+	return a.ID, nil
 }
 
-func (m *Manager) RequestLogin(phone string) (*PendingCode, error) {
-	// Check if account already exists
-	accounts, _ := m.store.ListAccounts()
-	var account *store.Account
-	for _, a := range accounts {
-		if a.Phone == phone {
-			account = a
-			break
-		}
-	}
-	if account == nil {
-		var err error
-		account, err = m.AddAccount(phone, "")
+// RequestLogin starts the authentication flow for a phone number
+func (m *Manager) RequestLogin(phone string) (*PendingLogin, error) {
+	// Find or create account
+	astore := m.AccountStore()
+	a, err := astore.GetByPhone(phone)
+	if err != nil {
+		a, err = astore.Create(phone, "")
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	p := &PendingCode{
+	p := &PendingLogin{
 		Phone:    phone,
 		CodeChan: make(chan string, 1),
 		PassChan: make(chan string, 1),
@@ -108,19 +90,40 @@ func (m *Manager) RequestLogin(phone string) (*PendingCode, error) {
 	m.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	client := tgclient.New(phone, m.apiID, m.apiHash, "", m.store, m.logger)
+	client := tgclient.New(phone, m.apiID, m.apiHash, "./data/sessions", m.logger)
 	client.SetStatusCallback(func(status string, floodWait int64) {
-		m.store.UpdateAccountStatus(account.ID, status, floodWait)
+		// status can be "online", "error", or "online|First|user|12345"
+		if len(status) > 6 && status[:6] == "online" {
+			astore.Update(a.ID, map[string]interface{}{
+				"status":         "online",
+				"last_login_at":  time.Now().UTC().Format("2006-01-02 15:04:05"),
+			})
+			// Parse user info from status string: "online|FirstName|username|userid"
+			parts := splitStatus(status)
+			if len(parts) >= 2 {
+				astore.Update(a.ID, map[string]interface{}{"first_name": parts[1]})
+			}
+			if len(parts) >= 3 {
+				astore.Update(a.ID, map[string]interface{}{"username": parts[2]})
+			}
+			if len(parts) >= 4 {
+				var uid int64
+				fmt.Sscanf(parts[3], "%d", &uid)
+				astore.Update(a.ID, map[string]interface{}{"user_id": uid})
+			}
+		} else {
+			astore.Update(a.ID, map[string]interface{}{"status": status})
+		}
 	})
 
 	cc := &connectedClient{
-		client:   client,
-		accountID: account.ID,
-		cancel:   cancel,
+		client:    client,
+		accountID: a.ID,
+		cancel:    cancel,
 	}
 
 	m.mu.Lock()
-	m.clients[account.ID] = cc
+	m.clients[a.ID] = cc
 	m.mu.Unlock()
 
 	go func() {
@@ -148,7 +151,7 @@ func (m *Manager) RequestLogin(phone string) (*PendingCode, error) {
 		m.mu.Unlock()
 
 		if err != nil && err != context.Canceled {
-			m.store.UpdateAccountStatus(account.ID, "error", 0)
+			astore.Update(a.ID, map[string]interface{}{"status": "error"})
 			p.ErrChan <- err
 		}
 		close(p.DoneChan)
@@ -183,17 +186,18 @@ func (m *Manager) SubmitPassword(phone, password string) error {
 	case p.PassChan <- password:
 		return nil
 	default:
-		return fmt.Errorf("2fa password already submitted")
+		return fmt.Errorf("password already submitted")
 	}
 }
 
-func (m *Manager) GetPendingCode(phone string) *PendingCode {
+func (m *Manager) GetPending(phone string) *PendingLogin {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.pending[phone]
 }
 
-func (m *Manager) GetClientAPI(id int64) *tgclient.Client {
+// GetClient returns the tgclient for an account if it's connected
+func (m *Manager) GetClient(id int64) *tgclient.Client {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if c, ok := m.clients[id]; ok {
@@ -202,50 +206,37 @@ func (m *Manager) GetClientAPI(id int64) *tgclient.Client {
 	return nil
 }
 
-// --- Operations ---
-
-func (m *Manager) CreateOperation(accountID int64, opType string, params json.RawMessage) (*store.Operation, error) {
-	op, err := m.store.CreateOperation(accountID, opType, params)
-	if err != nil {
-		return nil, err
+// LogoutAccount disconnects and removes session
+func (m *Manager) LogoutAccount(id int64) error {
+	m.mu.Lock()
+	if c, ok := m.clients[id]; ok {
+		c.cancel()
+		delete(m.clients, id)
 	}
+	m.mu.Unlock()
 
-	// Auto-execute if account is online
-	cli := m.GetClientAPI(accountID)
-	if cli != nil {
-		api := cli.API()
-		if api != nil {
-			m.engine.Execute(op, api)
-		}
-	}
-
-	return op, nil
+	astore := m.AccountStore()
+	astore.Update(id, map[string]interface{}{"status": "offline"})
+	// Delete session file
+	return nil
 }
 
-func (m *Manager) ListOperations(accountID int64) ([]*store.Operation, error) {
-	return m.store.ListOperations(accountID)
-}
-
-func (m *Manager) CancelOperation(id int64) {
-	m.engine.Cancel(id)
-}
-
-func (m *Manager) ImportSession(phone, b64data string) error {
+// ImportSession imports a base64-encoded session
+func (m *Manager) ImportSession(phone string, b64data string) (*store.Account, error) {
 	data, err := base64.StdEncoding.DecodeString(b64data)
 	if err != nil {
-		return fmt.Errorf("invalid base64: %w", err)
+		return nil, fmt.Errorf("invalid base64: %w", err)
 	}
-	return m.store.SaveSession(phone, data)
-}
-
-func (m *Manager) RotateProxy(accountID int64, newProxy string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if c, ok := m.clients[accountID]; ok {
-		c.cancel()
-		delete(m.clients, accountID)
+	astore := m.AccountStore()
+	a, err := astore.GetByPhone(phone)
+	if err != nil {
+		a, err = astore.Create(phone, "")
+		if err != nil {
+			return nil, err
+		}
 	}
-	return m.store.UpdateAccountProxy(accountID, newProxy)
+	store.NewCategoryStore(m.store.DB()).SaveSession(a.ID, data, m.store.DB())
+	return a, nil
 }
 
 func (m *Manager) Close() {
@@ -254,4 +245,18 @@ func (m *Manager) Close() {
 	for _, c := range m.clients {
 		c.cancel()
 	}
+}
+
+func splitStatus(s string) []string {
+	parts := make([]string, 0)
+	start := 0
+	sep := byte('|')
+	for i := 0; i < len(s); i++ {
+		if s[i] == sep {
+			parts = append(parts, s[start:i])
+			start = i + 1
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
 }

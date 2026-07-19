@@ -1,61 +1,54 @@
 package server
 
 import (
-	"context"
 	"io/fs"
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
+	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/madtoby2/tgcloud/internal/handler"
-	"github.com/madtoby2/tgcloud/internal/manager"
-	"go.uber.org/zap"
 )
 
-type Server struct {
-	http *http.Server
-	mgr  *manager.Manager
-}
-
-func New(addr string, mgr *manager.Manager, webFS fs.FS, logger *zap.Logger) *Server {
-	wsh := handler.NewWSHub()
-	h := handler.New(mgr, wsh)
-
+func New(h *handler.Handler, webFS fs.FS) chi.Router {
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins: []string{"*"},
-		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders: []string{"*"},
-	}))
+
+	r.Use(chimw.Logger)
+	r.Use(chimw.Recoverer)
+	r.Use(chimw.RealIP)
+	r.Use(corsMiddleware)
 
 	// API routes
 	r.Mount("/", h.Routes())
 
-	// Static web frontend (serve from / — index.html, style.css, app.js)
-	fileServer := http.FileServer(http.FS(webFS))
-	r.Get("/", fileServer.ServeHTTP)
-	r.Get("/style.css", fileServer.ServeHTTP)
-	r.Get("/app.js", fileServer.ServeHTTP)
-	r.NotFound(fileServer.ServeHTTP)
-
-	return &Server{
-		http: &http.Server{
-			Addr:         addr,
-			Handler:      r,
-			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 30 * time.Second,
-		},
-		mgr: mgr,
+	// Static file serving (SPA mode)
+	if webFS != nil {
+		fileServer := http.FileServer(http.FS(webFS))
+		r.Get("/", fileServer.ServeHTTP)
+		r.Get("/assets/*", fileServer.ServeHTTP)
+		r.NotFound(fileServer.ServeHTTP)
+	} else {
+		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write([]byte(`<!DOCTYPE html><html><head><title>tgcloud</title></head>
+<body style="background:#0f172a;color:#e2e8f0;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center"><h1 style="font-size:3rem;margin:0">tgcloud</h1>
+<p style="color:#64748b">Telegram cloud control panel</p>
+<p style="color:#475569">Frontend not built — run <code>cd web && npm run build</code></p></div></body></html>`))
+		})
 	}
+
+	return r
 }
 
-func (s *Server) Start() error { return s.http.ListenAndServe() }
-
-func (s *Server) Shutdown(ctx context.Context) error {
-	s.mgr.Close()
-	return s.http.Shutdown(ctx)
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(204)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
